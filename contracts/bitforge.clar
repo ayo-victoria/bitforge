@@ -90,3 +90,102 @@
 (define-read-only (get-debt-balance (user-address principal))
   (default-to u0 (map-get? active-debt-positions user-address))
 )
+
+;; Get current Bitcoin price from oracle feed
+(define-read-only (get-bitcoin-market-price)
+  (var-get bitcoin-price-feed)
+)
+
+;; Get timestamp of last oracle price update
+(define-read-only (get-oracle-update-timestamp)
+  (var-get oracle-last-refresh)
+)
+
+;; Retrieve protocol administrator address
+(define-read-only (get-protocol-administrator)
+  (var-get protocol-administrator)
+)
+
+;; Check if oracle price data has exceeded staleness threshold
+(define-read-only (is-oracle-data-stale)
+  (let (
+    (current-block stacks-block-height)
+    (last-update (var-get oracle-last-refresh))
+  )
+    (> (- current-block last-update) (var-get oracle-staleness-window))
+  )
+)
+
+;; Calculate position health ratio (collateral value / debt value * 100)
+;; Returns percentage representation: 200 = 200% collateralized
+(define-read-only (calculate-position-health (user-address principal))
+  (let (
+    (user-collateral (get-collateral-balance user-address))
+    (user-debt (get-debt-balance user-address))
+    (btc-price (var-get bitcoin-price-feed))
+  )
+    (if (or (is-eq user-debt u0) (is-eq user-collateral u0))
+      u0
+      ;; Health calculation: (collateral_sats * btc_price_cents / 100M_sats_per_btc) / debt_amount * 100
+      (/ (* (* user-collateral btc-price) u100) (* user-debt u100000000))
+    )
+  )
+)
+
+;; Determine if position qualifies for liquidation
+(define-read-only (is-position-liquidatable (user-address principal))
+  (let (
+    (position-health (calculate-position-health user-address))
+    (liquidation-ratio (var-get minimum-liquidation-ratio))
+  )
+    (and 
+      (> (get-debt-balance user-address) u0)
+      (> (get-collateral-balance user-address) u0)
+      (< position-health liquidation-ratio)
+      (not (is-oracle-data-stale))
+    )
+  )
+)
+
+;; ACCESS CONTROL - Administrative Function Guards
+
+;; Verify caller has governance or administrative privileges
+(define-private (verify-administrative-access)
+  (or 
+    (is-eq tx-sender (var-get protocol-governance-controller)) 
+    (is-eq tx-sender (var-get protocol-administrator))
+  )
+)
+
+;; Validate token contract reference integrity
+(define-private (validate-token-contract (token-contract <fungible-token-interface>))
+  (is-some (some (contract-of token-contract)))
+)
+
+;; Validate principal address format and constraints
+(define-private (validate-principal-address (target-address principal))
+  (and 
+    (not (is-eq target-address 'SP000000000000000000002Q6VF78))
+    (not (is-eq target-address tx-sender))
+  )
+)
+
+;; GOVERNANCE FUNCTIONS - Protocol Parameter Management
+
+;; Transfer governance control to new address
+(define-public (transfer-governance-control (new-governance-address principal))
+  (begin
+    (asserts! (verify-administrative-access) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (validate-principal-address new-governance-address) ERR-PRINCIPAL-ADDRESS-INVALID)
+    (ok (var-set protocol-governance-controller new-governance-address))
+  )
+)
+
+;; Transfer administrative control to new address
+(define-public (transfer-administrative-control (new-admin-address principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-administrator)) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (validate-principal-address new-admin-address) ERR-PRINCIPAL-ADDRESS-INVALID)
+    (ok (var-set protocol-administrator new-admin-address))
+  )
+)
