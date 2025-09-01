@@ -284,3 +284,100 @@
       (if (> outstanding-debt u0)
         ;; Active debt position - verify health after withdrawal
         (let (
+            (remaining-collateral (- current-collateral withdrawal-amount))
+          (post-withdrawal-health (/ (* (* remaining-collateral (var-get bitcoin-price-feed)) u100) 
+                                    (* outstanding-debt u100000000)))
+        )
+          ;; Ensure minimum position size and health requirements
+          (asserts! (>= remaining-collateral (var-get minimum-position-size)) ERR-MINIMUM-THRESHOLD-BREACH)
+          (asserts! (>= post-withdrawal-health (var-get required-collateral-ratio)) ERR-POSITION-UNHEALTHY)
+          
+          ;; Execute withdrawal
+          (map-set bitcoin-collateral-vault tx-sender remaining-collateral)
+          (try! (as-contract (contract-call? sbtc-contract transfer 
+                               withdrawal-amount 
+                               (as-contract tx-sender) 
+                               tx-sender 
+                               none)))
+          (ok withdrawal-amount)
+        )
+        ;; No active debt - execute simple withdrawal
+        (begin
+          (map-set bitcoin-collateral-vault tx-sender (- current-collateral withdrawal-amount))
+          (try! (as-contract (contract-call? sbtc-contract transfer 
+                               withdrawal-amount 
+                               (as-contract tx-sender) 
+                               tx-sender 
+                               none)))
+          (ok withdrawal-amount)
+        )
+      )
+    )
+  )
+)
+
+;; BORROWING MECHANISM - Stablecoin Minting Against Bitcoin Collateral
+
+;; Mint stablecoin debt position against Bitcoin collateral
+(define-public (mint-debt-position (stablecoin-contract <fungible-token-interface>) (borrowing-amount uint))
+  (begin
+    ;; Protocol safety and validity checks
+    (asserts! (not (var-get emergency-pause-active)) ERR-PROTOCOL-MAINTENANCE)
+    (asserts! (> borrowing-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (not (is-oracle-data-stale)) ERR-ORACLE-DATA-STALE)
+    (asserts! (validate-token-contract stablecoin-contract) ERR-ASSET-CONTRACT-INVALID)
+    
+    (let (
+      (bitcoin-collateral (get-collateral-balance tx-sender))
+      (existing-debt (get-debt-balance tx-sender))
+      (btc-market-price (var-get bitcoin-price-feed))
+      (block-timestamp stacks-block-height)
+    )
+      ;; Verify minimum collateral requirements
+      (asserts! (>= bitcoin-collateral (var-get minimum-position-size)) ERR-MINIMUM-THRESHOLD-BREACH)
+      
+      ;; Calculate borrowing capacity and validate request
+      (let (
+        (total-debt-position (+ existing-debt borrowing-amount))
+        ;; Collateral value: (sats * price_cents) / 100M_sats_per_btc
+        (collateral-value-usd (/ (* bitcoin-collateral btc-market-price) u100000000))
+        ;; Maximum borrowing: collateral_value / collateral_ratio * 100
+        (maximum-borrowing-capacity (/ (* collateral-value-usd u100) (var-get required-collateral-ratio)))
+      )
+        ;; Ensure borrowing doesn't exceed collateral capacity
+        (asserts! (<= total-debt-position maximum-borrowing-capacity) ERR-BORROWING-LIMIT-EXCEEDED)
+        
+        ;; Update debt registry
+        (map-set active-debt-positions tx-sender total-debt-position)
+        (map-set interest-accrual-checkpoint tx-sender block-timestamp)
+        
+        ;; Execute stablecoin minting with fee collection
+        (let ((origination-fee (/ (* borrowing-amount (var-get protocol-origination-fee)) u100)))
+          ;; Mint net amount to borrower
+          (try! (as-contract (contract-call? stablecoin-contract mint 
+                               (- borrowing-amount origination-fee) 
+                               tx-sender)))
+          ;; Mint fee to governance treasury
+          (try! (as-contract (contract-call? stablecoin-contract mint 
+                               origination-fee 
+                               (var-get protocol-governance-controller))))
+          
+          (ok borrowing-amount)
+        )
+      )
+    )
+  )
+)
+
+;; DEBT REPAYMENT - Position Closure and Partial Payment Processing
+
+;; Repay outstanding debt to reduce or eliminate position
+(define-public (repay-debt-position (stablecoin-contract <fungible-token-interface>) (repayment-amount uint))
+  (begin
+    ;; Input validation
+    (asserts! (> repayment-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (validate-token-contract stablecoin-contract) ERR-ASSET-CONTRACT-INVALID)
+    
+    (let (
+      (outstanding-debt (get-debt-balance tx-sender))
+    )
