@@ -189,3 +189,98 @@
     (ok (var-set protocol-administrator new-admin-address))
   )
 )
+
+;; Emergency protocol pause/unpause mechanism
+(define-public (toggle-emergency-pause (pause-status bool))
+  (begin
+    (asserts! (verify-administrative-access) ERR-UNAUTHORIZED-ACCESS)
+    (ok (var-set emergency-pause-active pause-status))
+  )
+)
+
+;; Update liquidation threshold parameters
+(define-public (configure-liquidation-threshold (new-threshold-percentage uint))
+  (begin
+    (asserts! (verify-administrative-access) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (>= new-threshold-percentage u110) ERR-POSITION-UNHEALTHY)
+    (ok (var-set minimum-liquidation-ratio new-threshold-percentage))
+  )
+)
+
+;; Update collateral requirements for new loans
+(define-public (configure-collateral-requirements (new-ratio-percentage uint))
+  (begin
+    (asserts! (verify-administrative-access) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (> new-ratio-percentage (var-get minimum-liquidation-ratio)) ERR-POSITION-UNHEALTHY)
+    (ok (var-set required-collateral-ratio new-ratio-percentage))
+  )
+)
+
+;; Update Bitcoin price through trusted oracle integration
+(define-public (refresh-bitcoin-price (oracle-contract <price-oracle-interface>))
+  (begin
+    (asserts! (verify-administrative-access) ERR-UNAUTHORIZED-ACCESS)
+    
+    (let (
+      (price-query (contract-call? oracle-contract get-price-in-cents))
+      (timestamp-query (contract-call? oracle-contract get-last-update-time))
+    )
+      (asserts! (is-ok price-query) ERR-ORACLE-DATA-STALE)
+      (asserts! (is-ok timestamp-query) ERR-ORACLE-DATA-STALE)
+      
+      (var-set bitcoin-price-feed (unwrap-panic price-query))
+      (var-set oracle-last-refresh (unwrap-panic timestamp-query))
+      
+      (ok (var-get bitcoin-price-feed))
+    )
+  )
+)
+
+;; CORE LENDING PROTOCOL - Bitcoin Collateral Management
+
+;; Deposit sBTC as collateral to enable borrowing capacity
+(define-public (deposit-bitcoin-collateral (sbtc-contract <fungible-token-interface>) (collateral-amount uint))
+  (begin
+    ;; Protocol safety checks
+    (asserts! (not (var-get emergency-pause-active)) ERR-PROTOCOL-MAINTENANCE)
+    (asserts! (> collateral-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (validate-token-contract sbtc-contract) ERR-ASSET-CONTRACT-INVALID)
+    
+    ;; Execute sBTC transfer from user to protocol vault
+    (let 
+      ((transfer-execution (try! (contract-call? sbtc-contract transfer 
+                                    collateral-amount 
+                                    tx-sender 
+                                    (as-contract tx-sender) 
+                                    none))))
+      
+      ;; Update user's collateral registry
+      (map-set bitcoin-collateral-vault 
+               tx-sender 
+               (+ (get-collateral-balance tx-sender) collateral-amount))
+      
+      (ok collateral-amount)
+    )
+  )
+)
+
+;; Withdraw sBTC collateral with position health verification
+(define-public (withdraw-bitcoin-collateral (sbtc-contract <fungible-token-interface>) (withdrawal-amount uint))
+  (begin
+    ;; Protocol safety checks
+    (asserts! (not (var-get emergency-pause-active)) ERR-PROTOCOL-MAINTENANCE)
+    (asserts! (> withdrawal-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (not (is-oracle-data-stale)) ERR-ORACLE-DATA-STALE)
+    (asserts! (validate-token-contract sbtc-contract) ERR-ASSET-CONTRACT-INVALID)
+    
+    (let (
+      (current-collateral (get-collateral-balance tx-sender))
+      (outstanding-debt (get-debt-balance tx-sender))
+    )
+      ;; Verify sufficient collateral exists
+      (asserts! (>= current-collateral withdrawal-amount) ERR-INADEQUATE-COLLATERAL)
+      
+      ;; Handle withdrawal logic based on debt status
+      (if (> outstanding-debt u0)
+        ;; Active debt position - verify health after withdrawal
+        (let (
